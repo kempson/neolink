@@ -176,21 +176,25 @@ fn bc_modern_msg<'a>(
             _ => context.get_encrypted(),
         };
 
-        let processed_payload_buf =
-            encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
         if context.in_bin_mode.contains(&(header.msg_num)) || in_binary {
             payload = match (context.get_encrypted(), encrypted_len) {
                 (EncryptionProtocol::FullAes { .. }, Some(encrypted_len)) => {
-                    // if if context.debug {
-                    //     log::trace!("Binary: {:X?}", &processed_payload_buf[0..30]);
-                    // }
+                    // Only FullAes encrypts the binary media payload, so this is
+                    // the one case that needs decrypting.
+                    let processed_payload_buf =
+                        encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
                     Some(BcPayloads::Binary(
                         processed_payload_buf[0..(encrypted_len as usize)].to_vec(),
                     ))
                 }
+                // Every other mode (Unencrypted, BCEncrypt, plain Aes) sends the
+                // binary media payload in the clear, so no decrypt is needed.
                 _ => Some(BcPayloads::Binary(payload_buf.to_vec())),
             };
         } else {
+            // XML payloads are always encrypted and must be decrypted to parse.
+            let processed_payload_buf =
+                encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
             if context.debug {
                 println!(
                     "Payload Txt: {:?}",

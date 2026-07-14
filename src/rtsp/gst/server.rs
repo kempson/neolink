@@ -110,7 +110,16 @@ impl NeoRtspServer {
                             remaining,
                             session.timeout(),
                         );
-                        RTSPFilterResult::Keep
+                        if remaining <= 0 {
+                            log::debug!(
+                                "Removing expired session {:?} (timeout {}s elapsed)",
+                                session.sessionid(),
+                                session.timeout(),
+                            );
+                            RTSPFilterResult::Remove
+                        } else {
+                            RTSPFilterResult::Keep
+                        }
                     }));
                 }
                 std::thread::sleep(Duration::from_secs(5));

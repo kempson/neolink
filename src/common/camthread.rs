@@ -72,9 +72,14 @@ impl NeoCamThread {
                             continue
                         },
                         Ok(Err(neolink_core::Error::UnintelligibleReply { reply, why })) => {
-                            // Camera does not support pings just wait forever
+                            // Camera does not support get_linktype pings. Don't park
+                            // forever: keep ticking so that if the link later goes
+                            // half-open the ping will *time out* (handled below) and
+                            // trigger a reconnect. The interval throttles this to one
+                            // probe per tick, so it is not a busy-loop.
                             log::trace!("Pings not supported: {reply:?}: {why}");
-                            futures::future::pending().await
+                            missed_pings = 0;
+                            continue;
                         },
                         Ok(Err(e)) => {
                             break Err(e.into());

@@ -279,11 +279,16 @@ pub struct BcMediaAdpcm {
 impl BcMediaAdpcm {
     /// The block size, this is bytes without the block header
     pub fn block_size(&self) -> u32 {
-        self.data.len() as u32 - 4
+        // saturating: a sub-4-byte frame would otherwise underflow this u32.
+        (self.data.len() as u32).saturating_sub(4)
     }
 
     /// Returns duration in micro seconds;
     pub fn duration(&self) -> Option<u32> {
+        if self.data.len() < 4 {
+            // Too small to contain the 4-byte block header
+            return None;
+        }
         let samples = self.block_size() * 2;
         // Always 8000Hz for ADPCM
         const SAMPLE_FREQUENCY: u32 = 8000;

@@ -1,9 +1,10 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
 use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_rtsp_server::prelude::{RTSPMediaExt, RTSPMediaFactoryExt};
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
@@ -87,7 +88,10 @@ impl StreamConfig {
         Ok(StreamConfig {
             resolution,
             bitrate,
-            fps,
+            // Never store 0: a zero fps both divides-by-zero in set_min_latency
+            // (1000 / fps) and, via the video PTS increment, would mean 1s/frame.
+            // Default to 25 until a real InfoV1/V2 frame updates it.
+            fps: if fps == 0 { 25 } else { fps },
             fps_table,
             bitrate_table,
             vid_type: None,
@@ -97,7 +101,7 @@ impl StreamConfig {
 
     fn update_fps(&mut self, fps: u32) {
         let new_fps = self.fps_table.get(fps as usize).copied().unwrap_or(fps);
-        self.fps = new_fps;
+        self.fps = if new_fps == 0 { 25 } else { new_fps };
     }
     #[allow(dead_code)]
     fn update_bitrate(&mut self, bitrate: u32) {
@@ -165,7 +169,10 @@ pub(super) async fn make_factory(
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
+                    let task_label = format!("{name}::{stream}");
                     tokio::task::spawn(async move {
+                        let _t0 = std::time::Instant::now();
+                        let r: AnyResult<()> = async {
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
 
@@ -176,19 +183,47 @@ pub(super) async fn make_factory(
                         log::trace!("{name}::{stream}: Learning camera stream type");
                         // Learn the camera data type
                         let mut buffer = vec![];
-                        let mut frame_count = 0usize;
 
                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
-                            stream_config.update_from_media(&media);
-                            buffer.push(media);
-                            if frame_count > 10
-                                || (stream_config.vid_type.is_some()
-                                    && stream_config.aud_type.is_some())
-                            {
-                                break;
+                        // Bound the learning phase so a silent camera can't block RTSP
+                        // media construction forever. Stop once both codecs are known,
+                        // or once we have video and have given audio a few seconds to
+                        // announce — some cameras send the audio header a little after
+                        // the first video, or have no audio at all. This grace is
+                        // frame-rate independent, so a low-fps sub-stream gets the same
+                        // audio window as a 25fps main stream (the old fixed 10-frame
+                        // cap was ~0.4s at 25fps and could build video-only before a
+                        // slow audio header arrived). The 15s timeout below is the
+                        // backstop for a camera that sends nothing at all.
+                        let learn = async {
+                            let learn_start = std::time::Instant::now();
+                            while let Some(media) = media_rx.recv().await {
+                                stream_config.update_from_media(&media);
+                                buffer.push(media);
+                                let have_video = stream_config.vid_type.is_some();
+                                let have_audio = stream_config.aud_type.is_some();
+                                if (have_video && have_audio)
+                                    || (have_video
+                                        && learn_start.elapsed() > Duration::from_secs(3))
+                                {
+                                    break;
+                                }
                             }
-                            frame_count += 1;
+                        };
+                        if tokio::time::timeout(Duration::from_secs(15), learn)
+                            .await
+                            .is_err()
+                            && stream_config.vid_type.is_none()
+                        {
+                            // Timed out having learnt no video: the camera is silent /
+                            // offline. Fail the DESCRIBE cleanly so the client retries,
+                            // rather than building a pipeline we can't feed. A slow-but-
+                            // alive camera that has already produced video falls through
+                            // and builds with what it has learnt so far, so a slow stream
+                            // is never failed into a DESCRIBE-retry churn.
+                            return Err(anyhow!(
+                                "{task_label}: no video within 15s (camera offline?)"
+                            ));
                         }
 
                         log::trace!("{name}::{stream}: Building the pipeline");
@@ -236,50 +271,102 @@ pub(super) async fn make_factory(
                             );
                         }
 
+                        // (Bus observability is registered on the factory via
+                        // connect_media_configure once the media pipeline exists; at
+                        // this point element.bus() is still None.)
+
                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
-                        // Run blocking code on a seperate thread
-                        // This is not an async thread
-                        std::thread::spawn(move || {
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
-                            let mut pools = Default::default();
-
-                            log::trace!("{name}::{stream}: Sending buffered frames");
-                            for buffered in buffer.drain(..) {
-                                send_to_sources(
-                                    buffered,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                )?;
-                            }
-
-                            log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
-                                    data,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                );
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                        // Supervised feed. The shared pipeline is built once and, with
+                        // set_shared(true)+SuspendMode::None, lives for the life of the
+                        // process; this loop is the only thing keeping it fed, so it must
+                        // never silently stop:
+                        //   - per-frame errors are logged and skipped, never fatal, so one
+                        //     bad frame can't kill the stream;
+                        //   - if the media channel closes (the camera stream task ended
+                        //     non-retryably), re-acquire it after a short backoff and keep
+                        //     feeding the same appsrcs.
+                        // The blocking send work runs on spawn_blocking (like the previous
+                        // raw thread) but is awaited so we can respawn it.
+                        log::trace!("{name}::{stream}: Starting supervised feed");
+                        let mut current_rx = Some(media_rx);
+                        let mut initial_buffer = Some(buffer);
+                        // u64 so the µs PTS counter never wraps. The previous u32
+                        // wrapped at 2^32 µs = 71m35s and produced a backwards PTS
+                        // jump that stalled hardware-accel H.264 decoders (QSV libmfx
+                        // futex-wait ~25 s; VAAPI hwdownload hard error). Observed
+                        // 72.4 min cycle on RLC-820A @ ~24.7 fps. Held outside the loop
+                        // and threaded through each feed session so PTS stays monotonic
+                        // across stream re-acquisitions (a reset to 0 would reintroduce
+                        // the same backwards jump into the still-live appsrc).
+                        let mut vid_ts = 0u64;
+                        let mut aud_ts = 0u64;
+                        loop {
+                            let rx = match current_rx.take() {
+                                Some(rx) => rx,
+                                None => {
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    match camera.stream_while_live(stream).await {
+                                        Ok(rx) => rx,
+                                        Err(e) => {
+                                            log::warn!(
+                                                "{task_label}: re-acquire stream failed (retrying): {e:?}"
+                                            );
+                                            continue;
+                                        }
+                                    }
                                 }
-                                r?;
+                            };
+                            let buf = initial_buffer.take().unwrap_or_default();
+                            let vid = vid_src.clone();
+                            let aud = aud_src.clone();
+                            let sc = stream_config.clone();
+                            let label = task_label.clone();
+                            let feed = tokio::task::spawn_blocking(move || {
+                                let mut rx = rx;
+                                let mut vid_ts = vid_ts;
+                                let mut aud_ts = aud_ts;
+                                for buffered in buf {
+                                    if let Err(e) = send_to_sources(
+                                        buffered, &vid, &aud, &mut vid_ts, &mut aud_ts, &sc,
+                                    ) {
+                                        log::warn!(
+                                            "{label}: error sending buffered frame (skipping): {e:?}"
+                                        );
+                                    }
+                                }
+                                while let Some(data) = rx.blocking_recv() {
+                                    if let Err(e) = send_to_sources(
+                                        data, &vid, &aud, &mut vid_ts, &mut aud_ts, &sc,
+                                    ) {
+                                        log::warn!(
+                                            "{label}: error sending frame (skipping): {e:?}"
+                                        );
+                                    }
+                                }
+                                // Hand the advanced counters back so the next session
+                                // continues monotonically from here.
+                                (vid_ts, aud_ts)
+                            });
+                            match feed.await {
+                                Ok((v, a)) => {
+                                    vid_ts = v;
+                                    aud_ts = a;
+                                }
+                                Err(e) => {
+                                    log::warn!("{task_label}: feed task ended abnormally: {e:?}");
+                                }
                             }
-                            log::trace!("All media recieved");
-                            AnyResult::Ok(())
-                        });
-                        AnyResult::Ok(())
+                            log::info!("{task_label}: media stream ended; will re-acquire");
+                        }
+                        }.await;
+                        match &r {
+                            Ok(_) => log::debug!("client task {task_label} ended cleanly after {:?}", _t0.elapsed()),
+                            Err(e) => log::info!("client task {task_label} exited after {:?}: {e:?}", _t0.elapsed()),
+                        }
+                        r
                     });
                 }
             }
@@ -296,56 +383,102 @@ pub(super) async fn make_factory(
         Ok(Some(element))
     })
     .await?;
+
+    // Observability: once GStreamer has actually built the media pipeline, watch its
+    // bus for errors / warnings / EOS. This fires on the RTSP server's main-context
+    // thread where the pipeline (and thus a real bus) exists, unlike the old per-client
+    // attempt that ran before the bin joined any pipeline.
+    let obs_stream = format!("{stream}");
+    let obs_added = std::sync::atomic::AtomicBool::new(false);
+    factory.connect_media_configure(move |_factory, media| {
+        // Register exactly once. With set_shared(true)+SuspendMode::None the media is
+        // built once and reused, so this normally fires once anyway; the guard stops a
+        // future media rebuild from accumulating forgotten watches on the same stream.
+        if obs_added.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let Some(bus) = media.element().bus() else {
+            // No bus yet: allow a later media-configure to try again.
+            obs_added.store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+        let label = obs_stream.clone();
+        if let Ok(guard) = bus.add_watch(move |_, msg| {
+            use gstreamer::MessageView;
+            match msg.view() {
+                MessageView::Error(e) => log::warn!(
+                    "gst[{label}] ERROR from {:?}: {} ({:?})",
+                    e.src().map(|s| s.name()),
+                    e.error(),
+                    e.debug()
+                ),
+                MessageView::Warning(w) => log::info!(
+                    "gst[{label}] WARN from {:?}: {}",
+                    w.src().map(|s| s.name()),
+                    w.error()
+                ),
+                MessageView::Eos(_) => log::info!("gst[{label}] EOS"),
+                _ => {}
+            }
+            gstreamer::glib::ControlFlow::Continue
+        }) {
+            // Keep the watch alive for the life of the media pipeline. Bounded: one per
+            // media, which under set_shared(true) is effectively one per camera::stream.
+            std::mem::forget(guard);
+        }
+    });
+
     Ok((factory, thread))
 }
 
 fn send_to_sources(
     data: BcMedia,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
+    vid_ts: &mut u64,
+    aud_ts: &mut u64,
     stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     // Update TS
     match data {
         BcMedia::Aac(aac) => {
-            let duration = aac.duration().expect("Could not calculate AAC duration");
+            let Some(duration) = aac.duration() else {
+                log::warn!("Skipping malformed AAC frame (len={})", aac.data.len());
+                return Ok(());
+            };
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
+                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
                 send_to_appsrc(
                     aud_src,
                     aac.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
+                    Duration::from_micros(*aud_ts),
                 )?;
             }
-            *aud_ts += duration;
+            *aud_ts += duration as u64;
         }
         BcMedia::Adpcm(adpcm) => {
-            let duration = adpcm
-                .duration()
-                .expect("Could not calculate ADPCM duration");
+            let Some(duration) = adpcm.duration() else {
+                log::warn!("Skipping malformed ADPCM frame (len={})", adpcm.data.len());
+                return Ok(());
+            };
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
+                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
                 send_to_appsrc(
                     aud_src,
                     adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
+                    Duration::from_micros(*aud_ts),
                 )?;
             }
-            *aud_ts += duration;
+            *aud_ts += duration as u64;
         }
         BcMedia::Iframe(BcMediaIframe { data, .. })
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                log::debug!("Sending VID: {:?} len={}", Duration::from_micros(*vid_ts), data.len());
+                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts))?;
             }
             const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
+            *vid_ts += (MICROSECONDS / if stream_config.fps > 0 { stream_config.fps } else { 25 }) as u64;
         }
         _ => {}
     }
@@ -356,9 +489,11 @@ fn send_to_appsrc(
     appsrc: &AppSrc,
     data: Vec<u8>,
     mut ts: Duration,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
 ) -> AnyResult<()> {
-    check_live(appsrc)?; // Stop if appsrc is dropped
+    if let Err(e) = check_live(appsrc) {
+        log::info!("check_live failed on {}: {e}", appsrc.name());
+        return Err(e);
+    }
 
     // In live mode we follow the advice in
     // https://gstreamer.freedesktop.org/documentation/additional/design/element-source.html?gi-language=c#live-sources
@@ -380,67 +515,55 @@ fn send_to_appsrc(
             return Ok(());
         }
     }
+    // Wrap the frame's existing Vec allocation directly rather than allocating
+    // a second GstBuffer and memcpy-ing into it. `data` is owned and consumed
+    // exactly once here (moved out of BcMedia, pushed to a single appsrc — the
+    // shared pipeline tees downstream in GStreamer, not here), so from_slice
+    // can take ownership zero-copy. On the 4K main streams at ~25fps this saves
+    // one heap alloc + one full-frame memcpy per frame.
+    //
+    // (Earlier this kept a HashMap<usize, BufferPool> keyed on each unique
+    // frame size; real h264 frames vary byte-for-byte so every frame created a
+    // fresh GstBufferPool, each allocating a socketpair and leaking ~50 FDs/sec.
+    // That pooling was removed; this finishes the job with no copy at all.)
     let buf = {
-        let msg_size = data.len();
-
-        // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
-
-        // Get a buffer from the pool and then copy in the data
-        let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
-            let time = ClockTime::from_useconds(ts.as_micros() as u64);
-            gst_buf_mut.set_dts(time);
-            gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-            gst_buf_data.copy_from_slice(data.as_slice());
-            drop(gst_buf_data);
-            new_buf
-        };
-
-        // Return the new buffer with the data
-        gst_buf
+        let mut new_buf = gstreamer::Buffer::from_slice(data);
+        let gst_buf_mut = new_buf.get_mut().unwrap();
+        let time = ClockTime::from_useconds(ts.as_micros() as u64);
+        gst_buf_mut.set_dts(time);
+        gst_buf_mut.set_pts(time);
+        new_buf
     };
 
     // Push buffer into the appsrc
     match appsrc.push_buffer(buf) {
-        Ok(_) => {
-            // log::info!(
-            //     "Send {}{} on {}",
-            //     data.data.len(),
-            //     if data.keyframe { " (keyframe)" } else { "" },
-            //     appsrc.name()
-            // );
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(FlowError::Flushing) => {
-            // Buffer is full just skip
-            log::info!(
-                "Buffer full on {} pausing stream until client consumes frames",
+            // Patched: demote to trace — this fires at frame rate when the
+            // consumer stalls, and at INFO it spams so hard it starves other tasks.
+            log::trace!(
+                "Buffer full on {} — dropping frame",
                 appsrc.name()
             );
             Ok(())
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
     }?;
-    // Check if we need to pause
-    if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Paused)
-    {
-        appsrc.set_state(gstreamer::State::Playing).unwrap();
-    } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Playing)
-    {
-        appsrc.set_state(gstreamer::State::Paused).unwrap();
+    // App-level Paused/Playing flow control for non-live appsrcs. Live sources
+    // must only transition between READY and PLAYING per GStreamer docs, and
+    // the branch at the top of this function early-returns when state !=
+    // Playing — so toggling a live appsrc to Paused here would deadlock it
+    // (buffer never fills, never flips back to Playing, every frame dropped).
+    if !appsrc.is_live() {
+        if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
+            && matches!(appsrc.current_state(), gstreamer::State::Paused)
+        {
+            appsrc.set_state(gstreamer::State::Playing).unwrap();
+        } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
+            && matches!(appsrc.current_state(), gstreamer::State::Playing)
+        {
+            appsrc.set_state(gstreamer::State::Paused).unwrap();
+        }
     }
     Ok(())
 }
@@ -520,7 +643,7 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(true);
     source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
@@ -533,7 +656,6 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast back"))?;
     let queue = make_queue("source_queue", buffer_size)?;
     let parser = make_element("h264parse", "parser")?;
-    // let stamper = make_element("h264timestamper", "stamper")?;
 
     bin.add_many([&source, &queue, &parser])?;
     Element::link_many([&source, &queue, &parser])?;
@@ -584,7 +706,6 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast back"))?;
     let queue = make_queue("source_queue", buffer_size)?;
     let parser = make_element("h265parse", "parser")?;
-    // let stamper = make_element("h265timestamper", "stamper")?;
 
     bin.add_many([&source, &queue, &parser])?;
     Element::link_many([&source, &queue, &parser])?;
@@ -624,7 +745,7 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(true);
     source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
@@ -957,7 +1078,8 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
     Ok(queue)
 }
 
-fn buffer_size(bitrate: u32) -> u32 {
-    // 0.1 seconds (according to bitrate) or 4kb what ever is larger
-    std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+fn buffer_size(_bitrate: u32) -> u32 {
+    // 4 MB — big enough for a 4K h264 keyframe, modest enough that 2 streams
+    // with a BufferPool min of 8 buffers stays in the low-tens-of-MB range.
+    4u32 * 1024u32 * 1024u32
 }

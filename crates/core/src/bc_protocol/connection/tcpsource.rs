@@ -3,9 +3,11 @@ use crate::Result;
 use crate::{bc::codex::BcCodex, Credentials};
 use delegate::delegate;
 use futures::{sink::Sink, stream::Stream};
+use socket2::{SockRef, TcpKeepalive};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::net::{TcpSocket, TcpStream};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -69,5 +71,17 @@ async fn connect_to(addr: SocketAddr) -> Result<TcpStream> {
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
     };
 
-    Ok(socket.connect(addr).await?)
+    let stream = socket.connect(addr).await?;
+
+    // Enable TCP keepalive so a silently dropped link (camera power-cut or AP blip
+    // that leaves the socket half-open with no FIN/RST) surfaces as a read error and
+    // drives a reconnect, instead of the reader task wedging forever on a dead socket.
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(20))
+        .with_interval(Duration::from_secs(10));
+    if let Err(e) = SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+        log::warn!("Could not enable TCP keepalive on camera socket: {e}");
+    }
+
+    Ok(stream)
 }
