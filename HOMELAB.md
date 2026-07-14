@@ -32,16 +32,29 @@ Local patches (originally squashed when the fork was vendored into homelab-apps;
 - **`crates/core/src/bcmedia/model.rs`**: `BcMediaAdpcm::block_size()` uses `saturating_sub(4)` and `duration()` returns `None` for <4-byte frames, avoiding a `u32` underflow.
 - **`crates/core/src/bc_protocol/connection/bcconn.rs`** `Poller::run` (upstream PR #399): when a subscriber channel is full, `try_send` (drop one frame) instead of a blocking `send().await`. The poll loop also routes keepalive replies, so blocking it risked a keepalive timeout and a full session reconnect; dropping a frame is a sub-GOP gap. Complements the existing `100 → 10000` buffer bump.
 
-## Build
+## CI
+
+Two workflows, deliberately split:
+
+- **`checks.yml`** runs `cargo fmt --check`, `cargo clippy` and `cargo test` on every PR into `homelab-frigate` and on every push to it. It holds `contents: read`, so it can report but never ship. It builds in `rust:slim-bookworm`, the same base as the image, so the code is compiled against the GStreamer the container actually runs (1.22) rather than whatever version a laptop happens to have.
+- **`homelab-image.yml`** builds the image, pushes `ghcr.io/kempson/neolink:homelab-frigate`, and replaces the `homelab-frigate` rolling release that `bootstrap.sh` downloads. It runs **only** on push to `homelab-frigate`, because every step of it changes what is deployed.
+
+So: open a PR against `homelab-frigate`, let the checks run, then merge. Merging is what deploys.
+
+Clippy is not run with `-D warnings`. Upstream's own code trips a handful of style lints, and denying them would mean editing files we otherwise leave alone, growing the diff we carry across each upstream rebase. Clippy's correctness lints are deny-by-default, so a real-bug lint still fails the build.
+
+The unit tests in `src/rtsp/factory.rs` guard the invariants these patches depend on. They matter more than their size suggests: upstream does not know these patches exist, so a rebase can silently break one, and at least one of them (monotonic timestamps) fails by aborting the process on the live CCTV box.
+
+## Build (local iteration)
 
 Uses a persistent builder container so cargo's `target/` cache persists across iterations. First build ~5 minutes; incremental ~30–60s.
 
-Run from the homelab-apps repo root so `$PWD/apps/frigate/vendor/neolink` is the vendored source path.
+Run from a clone of this repo. The source is no longer vendored into homelab-apps.
 
 ```bash
-# One-time setup (from homelab-apps repo root)
+# One-time setup (from the root of this repo)
 docker run -d --platform linux/amd64 --name neolink-builder \
-  -v "$PWD/apps/frigate/vendor/neolink:/src" -w /src \
+  -v "$PWD:/src" -w /src \
   rust:slim-bookworm sleep infinity
 docker exec neolink-builder bash -c 'apt-get update -qq && apt-get install -y -qq \
   build-essential openssl libssl-dev ca-certificates \
