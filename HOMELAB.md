@@ -8,7 +8,7 @@ Reolink RLC-820A cameras produce non-monotonic DTS on their h264 main RTSP strea
 
 ## Changes vs upstream
 
-Local patches (squashed when the fork was vendored into homelab-apps; further changes land as normal commits in the outer repo):
+Local patches (originally squashed when the fork was vendored into homelab-apps; they now live as normal commits on branch `homelab-frigate` in this repo, and CI publishes the built binary as the `homelab-frigate` release asset):
 
 - **`crates/core/src/bc_protocol/connection/bcconn.rs`**: BC protocol per-message channel size `100` → `10000`. Prevents ping-reply starvation when a downstream GStreamer appsrc briefly stalls.
 - **`src/rtsp/factory.rs`** `send_to_sources`: fps=0 fallback `.max(1)` replaced with `if stream_config.fps > 0 { stream_config.fps } else { 25 }`. The old code produced 1s-per-frame timestamps during the initial buffered replay before fps was learned — catastrophic for downstream muxers.
