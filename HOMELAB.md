@@ -70,59 +70,48 @@ Binary lands at `target/release/neolink`.
 
 ## Deploy to Frigate LXC (container 111 on node4)
 
-```bash
-# Direct SSH (usually works)
-scp target/release/neolink frigate:/tmp/neolink-bin
-ssh frigate 'chmod +x /tmp/neolink-bin && docker cp /tmp/neolink-bin neolink:/usr/local/bin/neolink && docker restart neolink'
+neolink ships as the container image this repo's CI builds. There is no bake, no
+binary staging, and nothing to compile on the host.
 
-# If SSH to frigate times out (VPN), hop via node1 → node4 → pct push
+1. Merge to `homelab-frigate`. `homelab-image.yml` builds and pushes
+   `ghcr.io/kempson/neolink:<sha>` (and the moving `:homelab-frigate` tag).
+2. In homelab-apps, bump the SHA in `apps/frigate/docker-compose.yml` and run
+   `apps/frigate/scripts/deploy.sh`.
+
+Merging publishes; the SHA bump deploys. Pinning by commit rather than by a moving
+tag means what runs on the cameras is always traceable to a reviewed commit, and a
+rollback is a one-line revert rather than a re-tag on the box.
+
+The image is private, so the LXC authenticates to GHCR with a read-only
+(`read:packages`) token, held in BWS as `ghcr-readonly-pat` and installed once by
+`bootstrap.sh` via `docker login`.
+
+### For a throwaway test only
+
+```bash
+# Ephemeral: patches the running container's filesystem and is lost on the next
+# container recreation. Never use this as a deploy.
 scp target/release/neolink node1:/tmp/neolink-bin
 ssh node1 'scp /tmp/neolink-bin node4:/tmp/ && ssh node4 "pct push 111 /tmp/neolink-bin /tmp/neolink-bin && pct exec 111 -- bash -c \"chmod +x /tmp/neolink-bin && docker cp /tmp/neolink-bin neolink:/usr/local/bin/neolink && docker restart neolink\""'
 ```
 
-The `docker cp` above is **ephemeral**: it patches the running container's
-filesystem but is lost on any container recreation (`docker-compose up -d` with a
-config change wipes it). Fine for a quick test; use the durable bake below for a
-real deploy.
+### Why the old bake is gone
 
-The neolink container runs image `neolink:patched`. **Re-bakes must build on top
-of `neolink:patched`, not from `neolink:original`.** `apps/frigate/scripts/bootstrap.sh` creates
-`neolink:original` from upstream and uses the `docker create` / `docker cp` /
-`docker commit` dance for the *first* bake; that works only because upstream
-carries no anonymous VOLUME on `/etc/neolink.toml`. The `commit` bakes that VOLUME
-into `:patched` (it was committed from a container that bind-mounted the config),
-so every subsequent re-bake that instantiates a container from `:patched` fails
-with `cannot mount volume over existing file`. On a deployed host only
-`neolink:patched` and `neolink:prev` remain, so `docker rmi neolink:patched`
-followed by a rebuild from `:original` would also destroy the only working image.
-Use the COPY-only build below instead.
+The previous recipe rebuilt an image by hand on the host: pull upstream, `docker
+create` / `docker cp` / `docker commit` a binary into it. Two things made that a
+trap.
 
-## Deploy properly (durable bake)
+The committed `neolink:patched` carried an anonymous `VOLUME` on
+`/etc/neolink.toml` (it was committed from a container that bind-mounted the config
+there) *and* a file at that path, so any later attempt to instantiate it failed with
+`cannot mount volume over existing file`. Re-bakes had to use a `FROM`+`COPY` build
+purely to dodge that. **The CI image has no such volume** (`Volumes: None`), because
+it is built from the Dockerfile rather than reconstructed from a running container,
+so the whole problem disappears rather than being worked around.
 
-```bash
-# Run on the Frigate LXC, or remotely via `ssh frigate ...`, after staging the
-# binary at /tmp/neolink-bin (scp target/release/neolink frigate:/tmp/neolink-bin).
-
-# 1. Tag the current working image as a rollback point. Per-bake timestamp so a
-#    second bake on the same day can't clobber an earlier known-good rollback tag.
-docker tag neolink:patched "neolink:rollback-$(date +%Y%m%d-%H%M%S)"
-
-# 2. Bake the new binary into a fresh neolink:patched via a COPY-only build.
-#    Do NOT use `docker create`/`docker commit`, and do NOT add a `RUN` step:
-#    the image carries an anonymous VOLUME at /etc/neolink.toml (it was committed
-#    from a container that bind-mounted the config there), so ANY container
-#    instantiation fails with "cannot mount volume over existing file". A plain
-#    `docker build` with FROM+COPY never instantiates a container, and COPY keeps
-#    the source file's mode, so no `RUN chmod` is needed in the Dockerfile.
-mkdir -p /tmp/nlbake && cp /tmp/neolink-bin /tmp/nlbake/neolink-bin && chmod +x /tmp/nlbake/neolink-bin
-printf 'FROM neolink:patched\nCOPY neolink-bin /usr/local/bin/neolink\n' > /tmp/nlbake/Dockerfile
-docker build -t neolink:patched /tmp/nlbake
-
-# 3. Recreate the container. The config bind-mount satisfies /etc/neolink.toml,
-#    so recreation works even though a bare instantiation would not. The host
-#    uses docker-compose v1 (`docker-compose`, not `docker compose`).
-cd /opt/frigate && docker-compose up -d --force-recreate neolink
-```
+The old `bootstrap.sh` also re-pulled `quantumentangledandy/neolink:latest` as the
+base on every run, so deploying a one-line patch would silently upgrade the upstream
+runtime underneath it.
 
 ### Verify
 
@@ -133,30 +122,28 @@ ffmpeg path is versioned (`/usr/lib/ffmpeg/<ver>/bin`), so discover it rather th
 hardcoding:
 
 ```bash
-docker exec neolink sha256sum /usr/local/bin/neolink   # matches the new binary
-docker inspect neolink --format 'restarts={{.RestartCount}} status={{.State.Status}}'
+docker inspect neolink --format 'image={{.Config.Image}} restarts={{.RestartCount}} status={{.State.Status}}'
 FF=$(docker exec frigate bash -lc 'ls -d /usr/lib/ffmpeg/*/bin/ffmpeg | tail -1')
 docker exec frigate "$FF" -rtsp_transport tcp \
   -i rtsp://192.168.0.35:18554/garden/main -frames:v 60 -f null -
 ```
 
-Expect 60 frames decoded with no corruption errors and `restarts=0`. A one-second
-burst of AAC non-monotonic-DTS warnings in the Frigate log at neolink startup is
-the normal buffered-replay artefact, not an ongoing fault.
+Expect the image to be the SHA you deployed, 60 frames decoded with no corruption
+errors, and `restarts=0`. A one-second burst of AAC non-monotonic-DTS warnings in
+the Frigate log at neolink startup is the normal buffered-replay artefact, not an
+ongoing fault. A burst of `App source is closed` warnings from neolink when Frigate
+restarts is likewise expected: Frigate's ffmpeg drops its RTSP session, the appsrc
+is torn down, and the supervised feed logs and skips rather than dying.
 
 ## Rollback
 
-Pick the saved rollback tag (`docker images neolink`), re-point `:patched` at it,
-and recreate:
+Revert the SHA in homelab-apps' `apps/frigate/docker-compose.yml` to the previous
+commit and re-run `apps/frigate/scripts/deploy.sh`. Every build CI has published is
+still in GHCR under its own SHA tag, so any past commit is one edit away.
 
-```bash
-docker tag neolink:rollback-YYYYMMDD-HHMMSS neolink:patched
-cd /opt/frigate && docker-compose up -d --force-recreate neolink
-```
-
-`neolink:prev` is an older baked image kept for the same purpose. Reverting to
-stock `quantumentangledandy/neolink` is a last resort only: it reintroduces the
-non-monotonic-DTS bug this fork exists to fix.
+The old hand-baked images (`neolink:patched`, `neolink:prev`, `neolink:rollback-*`)
+are still on the LXC as a break-glass, and the CI-built binary is still published as
+a release asset, but neither is on the deploy path any more.
 
 ## Neolink config: `stream = "Both"` per camera
 
