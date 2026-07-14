@@ -17,6 +17,7 @@ Local patches (originally squashed when the fork was vendored into homelab-apps;
 - **`src/rtsp/factory.rs`** per-client `aud_ts` / `vid_ts` widened from `u32` to `u64`. The u32 µs counter wrapped at `2^32 µs = 71 min 35 s`, producing a backwards PTS jump that stalled hardware-accel H.264 decoders downstream (QSV libmfx futex wait ~25 s; VAAPI hwdownload `Failed to sync surface`). Observed 72.4-min cycle on RLC-820A @ ~24.7 fps. Signature change required `duration as u64` / `(…) as u64` casts at the two increment sites.
 - **`crates/core/src/bc_protocol/connection/bcconn.rs`** poller task: the receive task wrapped `poller.run()` in `loop { if Err return }`, so an `Ok(())` return re-ran `run()`. `run()` returns `Ok(())` only when its `PollCommand` stream has closed, after which `reciever.next()` yields `Ready(None)` instantly and forever — the task busy-spun one core at 100 % in userspace with no syscalls, and because the spinning `select!` branch never returned `Pending`, the `cancelled()` branch could never be polled so `BcConnection::drop`'s `cancel()` couldn't stop it (observed: neolink pegged for hours on the Frigate LXC). Replaced the loop with `v = poller.run() => v` so the task ends when the stream closes.
 - **`src/rtsp/gst/factory.rs`**: `RTSPSuspendMode::Reset` → `RTSPSuspendMode::None`. With `Reset`, any camera network blip that caused Frigate's ffmpeg to time out and disconnect would tear down the shared RTSPMedia pipeline. The data-feeding thread would then pick up frames from the reconnected camera, call `check_live`, get "App source is closed" (pipeline bus is None), and exit permanently. Every subsequent Frigate reconnect got a dead or stale pipeline, requiring a neolink container restart to recover. With `None` the pipeline is never suspended: camera drops are absorbed by the feed thread blocking on `media_rx` and resuming when data flows again; Frigate reconnects get the live running pipeline immediately.
+- **`src/rtsp/factory.rs`** `send_to_appsrc`: DTS/PTS are stamped through a per-appsrc `MonotonicTs` guard so they can never move backwards. gst-rtsp-server queues RTP buffers for a slow TCP client on a per-transport backlog, and `gst_rtsp_stream_transport_backlog_push` asserts `queue_duration >= 0` (`rtsp-stream-transport.c`, still present on upstream master): a buffer entering the backlog may not predate the buffer at its head. It is a `g_assert`, so a violation aborts the whole process instead of dropping the slow client. Live appsrcs stamp buffers with the pipeline running time (`clock - base_time`), and GStreamer hands the media a fresh `base_time` each time it re-enters PLAYING, which restarts that running time near zero; if a client is holding a backlog at that moment (Frigate's ffmpeg stalled writing segments to the NFS recording mount) the next buffer lands below the backlog head and neolink dies with `Bail out! ... assertion failed: (queue_duration >= 0)`. On a backwards step the guard re-anchors its offset so stamps carry on from the last value at the source's own rate; clamping instead would pin the timestamp for as long as the pipeline had already been running. Observed on the Frigate LXC at 2026-07-14 01:05, where `restart: unless-stopped` recovered neolink ~1 s later.
 
 ### Feed-thread resilience pass
 
@@ -31,16 +32,29 @@ Local patches (originally squashed when the fork was vendored into homelab-apps;
 - **`crates/core/src/bcmedia/model.rs`**: `BcMediaAdpcm::block_size()` uses `saturating_sub(4)` and `duration()` returns `None` for <4-byte frames, avoiding a `u32` underflow.
 - **`crates/core/src/bc_protocol/connection/bcconn.rs`** `Poller::run` (upstream PR #399): when a subscriber channel is full, `try_send` (drop one frame) instead of a blocking `send().await`. The poll loop also routes keepalive replies, so blocking it risked a keepalive timeout and a full session reconnect; dropping a frame is a sub-GOP gap. Complements the existing `100 → 10000` buffer bump.
 
-## Build
+## CI
+
+Two workflows, deliberately split:
+
+- **`checks.yml`** runs `cargo fmt --check`, `cargo clippy` and `cargo test` on every PR into `homelab-frigate` and on every push to it. It holds `contents: read`, so it can report but never ship. It builds in `rust:slim-bookworm`, the same base as the image, so the code is compiled against the GStreamer the container actually runs (1.22) rather than whatever version a laptop happens to have.
+- **`homelab-image.yml`** builds the image, pushes `ghcr.io/kempson/neolink:homelab-frigate`, and replaces the `homelab-frigate` rolling release that `bootstrap.sh` downloads. It runs **only** on push to `homelab-frigate`, because every step of it changes what is deployed.
+
+So: open a PR against `homelab-frigate`, let the checks run, then merge. Merging is what deploys.
+
+Clippy is not run with `-D warnings`. Upstream's own code trips a handful of style lints, and denying them would mean editing files we otherwise leave alone, growing the diff we carry across each upstream rebase. Clippy's correctness lints are deny-by-default, so a real-bug lint still fails the build.
+
+The unit tests in `src/rtsp/factory.rs` guard the invariants these patches depend on. They matter more than their size suggests: upstream does not know these patches exist, so a rebase can silently break one, and at least one of them (monotonic timestamps) fails by aborting the process on the live CCTV box.
+
+## Build (local iteration)
 
 Uses a persistent builder container so cargo's `target/` cache persists across iterations. First build ~5 minutes; incremental ~30–60s.
 
-Run from the homelab-apps repo root so `$PWD/apps/frigate/vendor/neolink` is the vendored source path.
+Run from a clone of this repo. The source is no longer vendored into homelab-apps.
 
 ```bash
-# One-time setup (from homelab-apps repo root)
+# One-time setup (from the root of this repo)
 docker run -d --platform linux/amd64 --name neolink-builder \
-  -v "$PWD/apps/frigate/vendor/neolink:/src" -w /src \
+  -v "$PWD:/src" -w /src \
   rust:slim-bookworm sleep infinity
 docker exec neolink-builder bash -c 'apt-get update -qq && apt-get install -y -qq \
   build-essential openssl libssl-dev ca-certificates \

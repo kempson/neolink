@@ -301,8 +301,7 @@ pub(super) async fn make_factory(
                         // and threaded through each feed session so PTS stays monotonic
                         // across stream re-acquisitions (a reset to 0 would reintroduce
                         // the same backwards jump into the still-live appsrc).
-                        let mut vid_ts = 0u64;
-                        let mut aud_ts = 0u64;
+                        let mut feed_ts = FeedTs::default();
                         loop {
                             let rx = match current_rx.take() {
                                 Some(rx) => rx,
@@ -326,21 +325,18 @@ pub(super) async fn make_factory(
                             let label = task_label.clone();
                             let feed = tokio::task::spawn_blocking(move || {
                                 let mut rx = rx;
-                                let mut vid_ts = vid_ts;
-                                let mut aud_ts = aud_ts;
+                                let mut ts = feed_ts;
                                 for buffered in buf {
-                                    if let Err(e) = send_to_sources(
-                                        buffered, &vid, &aud, &mut vid_ts, &mut aud_ts, &sc,
-                                    ) {
+                                    if let Err(e) =
+                                        send_to_sources(buffered, &vid, &aud, &mut ts, &sc)
+                                    {
                                         log::warn!(
                                             "{label}: error sending buffered frame (skipping): {e:?}"
                                         );
                                     }
                                 }
                                 while let Some(data) = rx.blocking_recv() {
-                                    if let Err(e) = send_to_sources(
-                                        data, &vid, &aud, &mut vid_ts, &mut aud_ts, &sc,
-                                    ) {
+                                    if let Err(e) = send_to_sources(data, &vid, &aud, &mut ts, &sc) {
                                         log::warn!(
                                             "{label}: error sending frame (skipping): {e:?}"
                                         );
@@ -348,23 +344,29 @@ pub(super) async fn make_factory(
                                 }
                                 // Hand the advanced counters back so the next session
                                 // continues monotonically from here.
-                                (vid_ts, aud_ts)
+                                ts
                             });
                             match feed.await {
-                                Ok((v, a)) => {
-                                    vid_ts = v;
-                                    aud_ts = a;
+                                Ok(ts) => {
+                                    feed_ts = ts;
                                 }
                                 Err(e) => {
                                     log::warn!("{task_label}: feed task ended abnormally: {e:?}");
+                                    feed_ts = FeedTs::default();
                                 }
                             }
                             log::info!("{task_label}: media stream ended; will re-acquire");
                         }
                         }.await;
                         match &r {
-                            Ok(_) => log::debug!("client task {task_label} ended cleanly after {:?}", _t0.elapsed()),
-                            Err(e) => log::info!("client task {task_label} exited after {:?}: {e:?}", _t0.elapsed()),
+                            Ok(_) => log::debug!(
+                                "client task {task_label} ended cleanly after {:?}",
+                                _t0.elapsed()
+                            ),
+                            Err(e) => log::info!(
+                                "client task {task_label} exited after {:?}: {e:?}",
+                                _t0.elapsed()
+                            ),
                         }
                         r
                     });
@@ -431,12 +433,64 @@ pub(super) async fn make_factory(
     Ok((factory, thread))
 }
 
+/// Timestamps carried across a camera's feed sessions.
+///
+/// `vid_us`/`aud_us` are the synthetic µs clocks used by the non-live appsrcs.
+/// `vid_mono`/`aud_mono` guard the timestamp that is actually stamped onto each
+/// buffer, which for the live video sources is the pipeline running time rather
+/// than these counters.
+#[derive(Default)]
+struct FeedTs {
+    vid_us: u64,
+    aud_us: u64,
+    vid_mono: MonotonicTs,
+    aud_mono: MonotonicTs,
+}
+
+/// Keeps the DTS/PTS stamped on one appsrc's buffers non-decreasing.
+///
+/// gst-rtsp-server queues RTP buffers for a slow TCP client on a per-transport
+/// backlog, and `gst_rtsp_stream_transport_backlog_push` asserts
+/// `queue_duration >= 0` (rtsp-stream-transport.c): the DTS/PTS of a buffer
+/// entering the backlog may never predate the buffer already at its head. A
+/// failed assertion is a `g_assert`, so it aborts the whole process rather than
+/// dropping the client.
+///
+/// Live appsrcs stamp buffers with the pipeline running time (clock - base_time),
+/// and GStreamer hands the media a fresh base_time each time it re-enters
+/// PLAYING, which restarts that running time near zero. If a client is holding a
+/// backlog at that moment (Frigate's ffmpeg stalled writing recordings) the next
+/// buffer's timestamp lands below the backlog head and neolink aborts.
+///
+/// A backwards step re-anchors the offset so output carries on from the last
+/// stamp. Clamping instead would pin the timestamp for as long as the pipeline
+/// had already been running, which for a camera up for hours means a frozen
+/// clock rather than a one-second restart.
+#[derive(Default)]
+struct MonotonicTs {
+    last_in_us: Option<u64>,
+    last_out_us: u64,
+    offset_us: u64,
+}
+
+impl MonotonicTs {
+    fn stamp(&mut self, raw_us: u64) -> u64 {
+        if self.last_in_us.is_some_and(|prev_in| raw_us < prev_in) {
+            self.offset_us = self.last_out_us.saturating_add(1).saturating_sub(raw_us);
+        }
+        self.last_in_us = Some(raw_us);
+
+        let out = raw_us.saturating_add(self.offset_us).max(self.last_out_us);
+        self.last_out_us = out;
+        out
+    }
+}
+
 fn send_to_sources(
     data: BcMedia,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u64,
-    aud_ts: &mut u64,
+    ts: &mut FeedTs,
     stream_config: &StreamConfig,
 ) -> AnyResult<()> {
     // Update TS
@@ -447,14 +501,15 @@ fn send_to_sources(
                 return Ok(());
             };
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
+                log::debug!("Sending AAC: {:?}", Duration::from_micros(ts.aud_us));
                 send_to_appsrc(
                     aud_src,
                     aac.data,
-                    Duration::from_micros(*aud_ts),
+                    Duration::from_micros(ts.aud_us),
+                    &mut ts.aud_mono,
                 )?;
             }
-            *aud_ts += duration as u64;
+            ts.aud_us += duration as u64;
         }
         BcMedia::Adpcm(adpcm) => {
             let Some(duration) = adpcm.duration() else {
@@ -462,23 +517,38 @@ fn send_to_sources(
                 return Ok(());
             };
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
+                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(ts.aud_us));
                 send_to_appsrc(
                     aud_src,
                     adpcm.data,
-                    Duration::from_micros(*aud_ts),
+                    Duration::from_micros(ts.aud_us),
+                    &mut ts.aud_mono,
                 )?;
             }
-            *aud_ts += duration as u64;
+            ts.aud_us += duration as u64;
         }
         BcMedia::Iframe(BcMediaIframe { data, .. })
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
-                log::debug!("Sending VID: {:?} len={}", Duration::from_micros(*vid_ts), data.len());
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts))?;
+                log::debug!(
+                    "Sending VID: {:?} len={}",
+                    Duration::from_micros(ts.vid_us),
+                    data.len()
+                );
+                send_to_appsrc(
+                    vid_src,
+                    data,
+                    Duration::from_micros(ts.vid_us),
+                    &mut ts.vid_mono,
+                )?;
             }
             const MICROSECONDS: u32 = 1000000;
-            *vid_ts += (MICROSECONDS / if stream_config.fps > 0 { stream_config.fps } else { 25 }) as u64;
+            ts.vid_us += (MICROSECONDS
+                / if stream_config.fps > 0 {
+                    stream_config.fps
+                } else {
+                    25
+                }) as u64;
         }
         _ => {}
     }
@@ -489,6 +559,7 @@ fn send_to_appsrc(
     appsrc: &AppSrc,
     data: Vec<u8>,
     mut ts: Duration,
+    mono: &mut MonotonicTs,
 ) -> AnyResult<()> {
     if let Err(e) = check_live(appsrc) {
         log::info!("check_live failed on {}: {e}", appsrc.name());
@@ -529,7 +600,7 @@ fn send_to_appsrc(
     let buf = {
         let mut new_buf = gstreamer::Buffer::from_slice(data);
         let gst_buf_mut = new_buf.get_mut().unwrap();
-        let time = ClockTime::from_useconds(ts.as_micros() as u64);
+        let time = ClockTime::from_useconds(mono.stamp(ts.as_micros() as u64));
         gst_buf_mut.set_dts(time);
         gst_buf_mut.set_pts(time);
         new_buf
@@ -541,10 +612,7 @@ fn send_to_appsrc(
         Err(FlowError::Flushing) => {
             // Patched: demote to trace — this fires at frame rate when the
             // consumer stalls, and at INFO it spams so hard it starves other tasks.
-            log::trace!(
-                "Buffer full on {} — dropping frame",
-                appsrc.name()
-            );
+            log::trace!("Buffer full on {} — dropping frame", appsrc.name());
             Ok(())
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
@@ -1082,4 +1150,63 @@ fn buffer_size(_bitrate: u32) -> u32 {
     // 4 MB — big enough for a 4K h264 keyframe, modest enough that 2 streams
     // with a BufferPool min of 8 buffers stays in the low-tens-of-MB range.
     4u32 * 1024u32 * 1024u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MonotonicTs;
+
+    /// Running time under a stable base_time: stamps pass through untouched.
+    #[test]
+    fn rising_input_is_unchanged() {
+        let mut mono = MonotonicTs::default();
+        for us in [0u64, 40_000, 80_000, 120_000] {
+            assert_eq!(mono.stamp(us), us);
+        }
+    }
+
+    /// GStreamer redistributes a new base_time and the running time restarts near
+    /// zero. The stamp must keep rising, because gst-rtsp-server aborts the process
+    /// if a buffer entering a client's backlog predates the backlog head.
+    #[test]
+    fn base_time_reset_keeps_stamps_rising() {
+        let mut mono = MonotonicTs::default();
+        let before = mono.stamp(3_600_000_000);
+        let after = mono.stamp(0);
+        assert!(
+            after > before,
+            "stamp went backwards across a base_time reset: {} -> {}",
+            before,
+            after
+        );
+
+        // And it must keep advancing at the source's rate, not sit pinned at the
+        // pre-reset value until the new running time catches up.
+        assert_eq!(mono.stamp(40_000), after + 40_000);
+    }
+
+    /// The invariant gst-rtsp-server asserts on: stamps never decrease, whatever
+    /// the source does.
+    #[test]
+    fn stamps_never_decrease() {
+        let mut mono = MonotonicTs::default();
+        let raw = [
+            0u64, 40_000, 40_000, 80_000, 0, 40_000, 10, 0, 120_000, 5_000_000, 1,
+        ];
+
+        let mut prev = None;
+        for us in raw {
+            let out = mono.stamp(us);
+            if let Some(prev) = prev {
+                assert!(
+                    out >= prev,
+                    "stamp went backwards: {} -> {} (raw {})",
+                    prev,
+                    out,
+                    us
+                );
+            }
+            prev = Some(out);
+        }
+    }
 }

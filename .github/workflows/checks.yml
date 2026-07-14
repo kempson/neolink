@@ -1,0 +1,61 @@
+name: checks
+
+# Compiles, lints and tests every change before it can reach `homelab-frigate`,
+# the branch whose push publishes the binary the Frigate LXC runs.
+#
+# Deliberately separate from `homelab-image.yml`: that workflow pushes a mutable
+# GHCR tag and replaces the rolling release, so it must only ever run on merge.
+# This one holds `contents: read` and can report, never ship.
+
+on:
+  pull_request:
+    branches: [homelab-frigate]
+  push:
+    branches: [homelab-frigate]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Same base as the image build, so this compiles against the GStreamer the
+    # container actually ships (1.22 on bookworm) rather than whatever version
+    # the runner or a developer laptop happens to carry. The patches touch
+    # GStreamer's timestamp handling, so that difference is not academic.
+    container: rust:slim-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential openssl libssl-dev ca-certificates \
+            libgstrtspserver-1.0-dev libgstreamer1.0-dev libgtk2.0-dev \
+            protobuf-compiler libglib2.0-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: rustup component add rustfmt clippy
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # Not `-D warnings`: upstream's own code trips a handful of style lints, and
+      # denying them would mean editing files we otherwise leave untouched, which
+      # grows the diff we have to carry across every upstream rebase. Clippy's
+      # correctness lints are deny-by-default, so this still fails the build on the
+      # class of lint that indicates a real bug.
+      - name: Lint
+        run: cargo clippy --all-targets
+
+      # Guards the invariants the local patches depend on. These patches exist
+      # precisely because upstream does not know about them, so an upstream rebase
+      # can silently break one; the tests are the tripwire.
+      - name: Test
+        run: cargo test
