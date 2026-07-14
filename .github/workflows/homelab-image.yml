@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 concurrency:
@@ -43,9 +43,23 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Report digest
+      # Also publish the raw binary. bootstrap.sh bakes it into the upstream
+      # image, and a release asset needs no registry credentials on the LXC.
+      - name: Extract binary from the built image
         run: |
-          echo "Pull with:" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "docker pull ghcr.io/${{ github.repository_owner }}/neolink:homelab-frigate" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          docker create --name x "ghcr.io/${{ github.repository_owner }}/neolink:${{ github.sha }}"
+          docker cp x:/usr/local/bin/neolink ./neolink_linux_amd64
+          docker rm x
+          chmod +x neolink_linux_amd64
+          sha256sum neolink_linux_amd64 | tee neolink_linux_amd64.sha256
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete homelab-frigate --yes --cleanup-tag 2>/dev/null || true
+          gh release create homelab-frigate \
+            --title "neolink homelab-frigate build" \
+            --notes "Patched neolink for Frigate multi-client RTSP. Built from ${{ github.sha }}." \
+            --target "${{ github.sha }}" \
+            neolink_linux_amd64 neolink_linux_amd64.sha256
