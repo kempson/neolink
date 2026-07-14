@@ -47,9 +47,9 @@ jobs:
       # image, and a release asset needs no registry credentials on the LXC.
       - name: Extract binary from the built image
         run: |
-          docker create --name x "ghcr.io/${{ github.repository_owner }}/neolink:${{ github.sha }}"
-          docker cp x:/usr/local/bin/neolink ./neolink_linux_amd64
-          docker rm x
+          docker create --name neolink-extract "ghcr.io/${{ github.repository_owner }}/neolink:${{ github.sha }}"
+          docker cp neolink-extract:/usr/local/bin/neolink ./neolink_linux_amd64
+          docker rm neolink-extract
           chmod +x neolink_linux_amd64
           sha256sum neolink_linux_amd64 | tee neolink_linux_amd64.sha256
 
