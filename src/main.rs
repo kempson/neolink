@@ -40,6 +40,7 @@ mod battery;
 mod cmdline;
 mod common;
 mod config;
+mod crash;
 #[cfg(feature = "gstreamer")]
 mod image;
 mod mqtt;
@@ -64,6 +65,10 @@ pub(crate) type AnyResult<T> = Result<T, anyhow::Error>;
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+
+    if !crash::install_abort_backtrace() {
+        warn!("Could not install the abort handler; an abort will print no backtrace");
+    }
 
     info!(
         "Neolink {} {}",
