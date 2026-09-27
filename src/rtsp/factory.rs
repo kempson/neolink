@@ -466,22 +466,36 @@ struct FeedTs {
 /// stamp. Clamping instead would pin the timestamp for as long as the pipeline
 /// had already been running, which for a camera up for hours means a frozen
 /// clock rather than a one-second restart.
+///
+/// A buffer is also never stamped before the end of the previous one. The live
+/// audio appsrc is stamped with each AAC frame's arrival time, and frames arrive
+/// in bursts closer together than the audio each one carries. Once faad decodes
+/// them the samples overlap, and rtpL16pay stamps each packet from its byte
+/// offset into the buffer it started in, so a later packet can carry an earlier
+/// timestamp even though every input stamp rose. Video passes a zero duration,
+/// since rtph264pay gives every packet of a frame that frame's own timestamp.
 #[derive(Default)]
 struct MonotonicTs {
     last_in_us: Option<u64>,
     last_out_us: u64,
+    end_us: u64,
     offset_us: u64,
 }
 
 impl MonotonicTs {
-    fn stamp(&mut self, raw_us: u64) -> u64 {
+    fn stamp(&mut self, raw_us: u64, duration_us: u64) -> u64 {
         if self.last_in_us.is_some_and(|prev_in| raw_us < prev_in) {
-            self.offset_us = self.last_out_us.saturating_add(1).saturating_sub(raw_us);
+            let resume_us = self.last_out_us.saturating_add(1).max(self.end_us);
+            self.offset_us = resume_us.saturating_sub(raw_us);
         }
         self.last_in_us = Some(raw_us);
 
-        let out = raw_us.saturating_add(self.offset_us).max(self.last_out_us);
+        let out = raw_us
+            .saturating_add(self.offset_us)
+            .max(self.last_out_us)
+            .max(self.end_us);
         self.last_out_us = out;
+        self.end_us = out.saturating_add(duration_us);
         out
     }
 }
@@ -506,6 +520,7 @@ fn send_to_sources(
                     aud_src,
                     aac.data,
                     Duration::from_micros(ts.aud_us),
+                    Duration::from_micros(duration as u64),
                     &mut ts.aud_mono,
                 )?;
             }
@@ -522,6 +537,7 @@ fn send_to_sources(
                     aud_src,
                     adpcm.data,
                     Duration::from_micros(ts.aud_us),
+                    Duration::from_micros(duration as u64),
                     &mut ts.aud_mono,
                 )?;
             }
@@ -539,6 +555,7 @@ fn send_to_sources(
                     vid_src,
                     data,
                     Duration::from_micros(ts.vid_us),
+                    Duration::ZERO,
                     &mut ts.vid_mono,
                 )?;
             }
@@ -559,6 +576,7 @@ fn send_to_appsrc(
     appsrc: &AppSrc,
     data: Vec<u8>,
     mut ts: Duration,
+    duration: Duration,
     mono: &mut MonotonicTs,
 ) -> AnyResult<()> {
     if let Err(e) = check_live(appsrc) {
@@ -600,7 +618,9 @@ fn send_to_appsrc(
     let buf = {
         let mut new_buf = gstreamer::Buffer::from_slice(data);
         let gst_buf_mut = new_buf.get_mut().unwrap();
-        let time = ClockTime::from_useconds(mono.stamp(ts.as_micros() as u64));
+        let time = ClockTime::from_useconds(
+            mono.stamp(ts.as_micros() as u64, duration.as_micros() as u64),
+        );
         gst_buf_mut.set_dts(time);
         gst_buf_mut.set_pts(time);
         new_buf
@@ -1161,8 +1181,41 @@ mod tests {
     fn rising_input_is_unchanged() {
         let mut mono = MonotonicTs::default();
         for us in [0u64, 40_000, 80_000, 120_000] {
-            assert_eq!(mono.stamp(us), us);
+            assert_eq!(mono.stamp(us, 0), us);
         }
+    }
+
+    /// Steady audio, one 64 ms AAC frame every 64 ms, passes through untouched.
+    #[test]
+    fn contiguous_audio_is_unchanged() {
+        let mut mono = MonotonicTs::default();
+        for us in [0u64, 64_000, 128_000, 192_000] {
+            assert_eq!(mono.stamp(us, 64_000), us);
+        }
+    }
+
+    /// AAC frames arriving 1 ms apart would overlap once decoded, which is what
+    /// makes rtpL16pay emit a packet stamped before the one ahead of it. Each
+    /// frame starts where the previous one ends, and arrival time takes over
+    /// again once the burst has been absorbed.
+    #[test]
+    fn bursty_audio_does_not_overlap() {
+        let mut mono = MonotonicTs::default();
+        assert_eq!(mono.stamp(0, 64_000), 0);
+        assert_eq!(mono.stamp(1_000, 64_000), 64_000);
+        assert_eq!(mono.stamp(128_000, 64_000), 128_000);
+        assert_eq!(mono.stamp(129_000, 64_000), 192_000);
+    }
+
+    /// After a base_time reset audio resumes where the last frame ended, not
+    /// one microsecond after it started.
+    #[test]
+    fn base_time_reset_resumes_after_audio_end() {
+        let mut mono = MonotonicTs::default();
+        let before = mono.stamp(3_600_000_000, 64_000);
+        let after = mono.stamp(0, 64_000);
+        assert_eq!(after, before + 64_000);
+        assert_eq!(mono.stamp(64_000, 64_000), after + 64_000);
     }
 
     /// GStreamer redistributes a new base_time and the running time restarts near
@@ -1171,8 +1224,8 @@ mod tests {
     #[test]
     fn base_time_reset_keeps_stamps_rising() {
         let mut mono = MonotonicTs::default();
-        let before = mono.stamp(3_600_000_000);
-        let after = mono.stamp(0);
+        let before = mono.stamp(3_600_000_000, 0);
+        let after = mono.stamp(0, 0);
         assert!(
             after > before,
             "stamp went backwards across a base_time reset: {} -> {}",
@@ -1182,7 +1235,7 @@ mod tests {
 
         // And it must keep advancing at the source's rate, not sit pinned at the
         // pre-reset value until the new running time catches up.
-        assert_eq!(mono.stamp(40_000), after + 40_000);
+        assert_eq!(mono.stamp(40_000, 0), after + 40_000);
     }
 
     /// The invariant gst-rtsp-server asserts on: stamps never decrease, whatever
@@ -1196,7 +1249,7 @@ mod tests {
 
         let mut prev = None;
         for us in raw {
-            let out = mono.stamp(us);
+            let out = mono.stamp(us, 0);
             if let Some(prev) = prev {
                 assert!(
                     out >= prev,
