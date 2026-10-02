@@ -474,29 +474,74 @@ struct FeedTs {
 /// offset into the buffer it started in, so a later packet can carry an earlier
 /// timestamp even though every input stamp rose. Video passes a zero duration,
 /// since rtph264pay gives every packet of a frame that frame's own timestamp.
+///
+/// Chaining frames end to end makes the stamps follow the camera's audio clock
+/// whenever audio arrives faster than real time. A burst is absorbed as soon as
+/// a later frame arrives after the chain's end, but a camera whose audio clock
+/// runs fast never leaves that gap, so the stamps creep ahead of the running
+/// time without limit. gst-rtsp-server holds each buffer until the clock
+/// reaches its stamp, so that lead is how far the audio plays behind the video.
+/// When the smallest lead over a whole window stays above
+/// `MAX_SUSTAINED_LEAD_US`, frames are dropped until it falls back under it.
 #[derive(Default)]
 struct MonotonicTs {
     last_in_us: Option<u64>,
     last_out_us: u64,
     end_us: u64,
     offset_us: u64,
+    window_start_us: Option<u64>,
+    window_min_lead_us: u64,
+    shedding: bool,
 }
 
+/// How long a lead has to persist before it counts as clock drift rather than
+/// a burst still being absorbed.
+const LEAD_WINDOW_US: u64 = 5_000_000;
+/// The audio/video offset tolerated before frames are dropped to pull it back.
+const MAX_SUSTAINED_LEAD_US: u64 = 100_000;
+
 impl MonotonicTs {
-    fn stamp(&mut self, raw_us: u64, duration_us: u64) -> u64 {
+    /// Returns the stamp for the buffer, or `None` when it should be dropped to
+    /// shed accumulated lead.
+    fn stamp(&mut self, raw_us: u64, duration_us: u64) -> Option<u64> {
         if self.last_in_us.is_some_and(|prev_in| raw_us < prev_in) {
             let resume_us = self.last_out_us.saturating_add(1).max(self.end_us);
             self.offset_us = resume_us.saturating_sub(raw_us);
+            self.window_start_us = None;
+            self.shedding = false;
         }
         self.last_in_us = Some(raw_us);
 
-        let out = raw_us
-            .saturating_add(self.offset_us)
-            .max(self.last_out_us)
-            .max(self.end_us);
+        let anchored_us = raw_us.saturating_add(self.offset_us);
+        let out = anchored_us.max(self.last_out_us).max(self.end_us);
+        let lead_us = out - anchored_us;
+
+        if self.shedding {
+            if lead_us > MAX_SUSTAINED_LEAD_US {
+                return None;
+            }
+            self.shedding = false;
+        }
+        match self.window_start_us {
+            None => {
+                self.window_start_us = Some(anchored_us);
+                self.window_min_lead_us = lead_us;
+            }
+            Some(start_us) => {
+                self.window_min_lead_us = self.window_min_lead_us.min(lead_us);
+                if anchored_us.saturating_sub(start_us) >= LEAD_WINDOW_US {
+                    self.window_start_us = None;
+                    if self.window_min_lead_us > MAX_SUSTAINED_LEAD_US {
+                        self.shedding = true;
+                        return None;
+                    }
+                }
+            }
+        }
+
         self.last_out_us = out;
         self.end_us = out.saturating_add(duration_us);
-        out
+        Some(out)
     }
 }
 
@@ -615,12 +660,14 @@ fn send_to_appsrc(
     // frame size; real h264 frames vary byte-for-byte so every frame created a
     // fresh GstBufferPool, each allocating a socketpair and leaking ~50 FDs/sec.
     // That pooling was removed; this finishes the job with no copy at all.)
+    let Some(stamp_us) = mono.stamp(ts.as_micros() as u64, duration.as_micros() as u64) else {
+        log::debug!("Dropping a frame on {} to shed clock drift", appsrc.name());
+        return Ok(());
+    };
     let buf = {
         let mut new_buf = gstreamer::Buffer::from_slice(data);
         let gst_buf_mut = new_buf.get_mut().unwrap();
-        let time = ClockTime::from_useconds(
-            mono.stamp(ts.as_micros() as u64, duration.as_micros() as u64),
-        );
+        let time = ClockTime::from_useconds(stamp_us);
         gst_buf_mut.set_dts(time);
         gst_buf_mut.set_pts(time);
         new_buf
@@ -1174,14 +1221,14 @@ fn buffer_size(_bitrate: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::MonotonicTs;
+    use super::{MonotonicTs, LEAD_WINDOW_US, MAX_SUSTAINED_LEAD_US};
 
     /// Running time under a stable base_time: stamps pass through untouched.
     #[test]
     fn rising_input_is_unchanged() {
         let mut mono = MonotonicTs::default();
         for us in [0u64, 40_000, 80_000, 120_000] {
-            assert_eq!(mono.stamp(us, 0), us);
+            assert_eq!(mono.stamp(us, 0).unwrap(), us);
         }
     }
 
@@ -1190,7 +1237,7 @@ mod tests {
     fn contiguous_audio_is_unchanged() {
         let mut mono = MonotonicTs::default();
         for us in [0u64, 64_000, 128_000, 192_000] {
-            assert_eq!(mono.stamp(us, 64_000), us);
+            assert_eq!(mono.stamp(us, 64_000).unwrap(), us);
         }
     }
 
@@ -1201,10 +1248,10 @@ mod tests {
     #[test]
     fn bursty_audio_does_not_overlap() {
         let mut mono = MonotonicTs::default();
-        assert_eq!(mono.stamp(0, 64_000), 0);
-        assert_eq!(mono.stamp(1_000, 64_000), 64_000);
-        assert_eq!(mono.stamp(128_000, 64_000), 128_000);
-        assert_eq!(mono.stamp(129_000, 64_000), 192_000);
+        assert_eq!(mono.stamp(0, 64_000).unwrap(), 0);
+        assert_eq!(mono.stamp(1_000, 64_000).unwrap(), 64_000);
+        assert_eq!(mono.stamp(128_000, 64_000).unwrap(), 128_000);
+        assert_eq!(mono.stamp(129_000, 64_000).unwrap(), 192_000);
     }
 
     /// After a base_time reset audio resumes where the last frame ended, not
@@ -1212,10 +1259,10 @@ mod tests {
     #[test]
     fn base_time_reset_resumes_after_audio_end() {
         let mut mono = MonotonicTs::default();
-        let before = mono.stamp(3_600_000_000, 64_000);
-        let after = mono.stamp(0, 64_000);
+        let before = mono.stamp(3_600_000_000, 64_000).unwrap();
+        let after = mono.stamp(0, 64_000).unwrap();
         assert_eq!(after, before + 64_000);
-        assert_eq!(mono.stamp(64_000, 64_000), after + 64_000);
+        assert_eq!(mono.stamp(64_000, 64_000).unwrap(), after + 64_000);
     }
 
     /// GStreamer redistributes a new base_time and the running time restarts near
@@ -1224,8 +1271,8 @@ mod tests {
     #[test]
     fn base_time_reset_keeps_stamps_rising() {
         let mut mono = MonotonicTs::default();
-        let before = mono.stamp(3_600_000_000, 0);
-        let after = mono.stamp(0, 0);
+        let before = mono.stamp(3_600_000_000, 0).unwrap();
+        let after = mono.stamp(0, 0).unwrap();
         assert!(
             after > before,
             "stamp went backwards across a base_time reset: {} -> {}",
@@ -1235,7 +1282,7 @@ mod tests {
 
         // And it must keep advancing at the source's rate, not sit pinned at the
         // pre-reset value until the new running time catches up.
-        assert_eq!(mono.stamp(40_000, 0), after + 40_000);
+        assert_eq!(mono.stamp(40_000, 0).unwrap(), after + 40_000);
     }
 
     /// The invariant gst-rtsp-server asserts on: stamps never decrease, whatever
@@ -1249,7 +1296,7 @@ mod tests {
 
         let mut prev = None;
         for us in raw {
-            let out = mono.stamp(us, 0);
+            let out = mono.stamp(us, 0).unwrap();
             if let Some(prev) = prev {
                 assert!(
                     out >= prev,
@@ -1260,6 +1307,59 @@ mod tests {
                 );
             }
             prev = Some(out);
+        }
+    }
+
+    /// A camera whose audio clock runs 1% fast delivers a 64 ms frame every
+    /// 63.36 ms. Chained end to end the stamps would gain 10 ms a second on the
+    /// running time forever, which is audio playing further and further behind
+    /// the video. The lead must stay bounded, and the frames that are kept must
+    /// still never overlap.
+    #[test]
+    fn fast_audio_clock_lead_stays_bounded() {
+        let mut mono = MonotonicTs::default();
+        let mut prev_end = 0u64;
+        let mut dropped = 0;
+        for i in 0..20_000u64 {
+            let raw = i * 63_360;
+            match mono.stamp(raw, 64_000) {
+                Some(out) => {
+                    assert!(out >= prev_end, "frame {i} overlaps the previous one");
+                    assert!(
+                        out - raw <= MAX_SUSTAINED_LEAD_US + 3 * LEAD_WINDOW_US / 100,
+                        "lead reached {} us at frame {i}",
+                        out - raw
+                    );
+                    prev_end = out + 64_000;
+                }
+                None => dropped += 1,
+            }
+        }
+        assert!(dropped > 0);
+    }
+
+    /// Bursts that average out to real time are absorbed without losing audio:
+    /// four 64 ms frames land together every 256 ms.
+    #[test]
+    fn real_time_bursts_are_not_dropped() {
+        let mut mono = MonotonicTs::default();
+        for burst in 0..1_000u64 {
+            for j in 0..4u64 {
+                let raw = burst * 256_000 + j * 1_000;
+                assert!(
+                    mono.stamp(raw, 64_000).is_some(),
+                    "dropped frame {j} of burst {burst}"
+                );
+            }
+        }
+    }
+
+    /// Video carries no duration, so it never builds a lead and never drops.
+    #[test]
+    fn video_is_never_dropped() {
+        let mut mono = MonotonicTs::default();
+        for i in 0..10_000u64 {
+            assert_eq!(mono.stamp(i * 40_000, 0), Some(i * 40_000));
         }
     }
 }
