@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
-use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_app::{AppLeakyType, AppSrc, AppSrcCallbacks, AppStreamType};
 use gstreamer_rtsp_server::prelude::{RTSPMediaExt, RTSPMediaFactoryExt};
 use neolink_core::{
     bc_protocol::StreamKind,
@@ -279,15 +279,18 @@ pub(super) async fn make_factory(
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
-                        // Supervised feed. The shared pipeline is built once and, with
-                        // set_shared(true)+SuspendMode::None, lives for the life of the
-                        // process; this loop is the only thing keeping it fed, so it must
-                        // never silently stop:
+                        // Supervised feed. This loop is the only thing keeping the
+                        // media fed, so while the media exists it must never silently
+                        // stop:
                         //   - per-frame errors are logged and skipped, never fatal, so one
                         //     bad frame can't kill the stream;
                         //   - if the media channel closes (the camera stream task ended
                         //     non-retryably), re-acquire it after a short backoff and keep
                         //     feeding the same appsrcs.
+                        // It ends once gst-rtsp-server has torn the media down. Each
+                        // rebuild of the media calls create_element again and starts a
+                        // new feed, so a feed that outlived its media would hold its
+                        // appsrcs and its camera subscription for the life of the process.
                         // The blocking send work runs on spawn_blocking (like the previous
                         // raw thread) but is awaited so we can respawn it.
                         log::trace!("{name}::{stream}: Starting supervised feed");
@@ -306,6 +309,10 @@ pub(super) async fn make_factory(
                             let rx = match current_rx.take() {
                                 Some(rx) => rx,
                                 None => {
+                                    if media_gone(&vid_src, &aud_src) {
+                                        log::info!("{task_label}: media torn down; ending feed");
+                                        return Ok(());
+                                    }
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     match camera.stream_while_live(stream).await {
                                         Ok(rx) => rx,
@@ -336,6 +343,9 @@ pub(super) async fn make_factory(
                                     }
                                 }
                                 while let Some(data) = rx.blocking_recv() {
+                                    if media_gone(&vid, &aud) {
+                                        return (ts, true);
+                                    }
                                     if let Err(e) = send_to_sources(data, &vid, &aud, &mut ts, &sc) {
                                         log::warn!(
                                             "{label}: error sending frame (skipping): {e:?}"
@@ -344,10 +354,14 @@ pub(super) async fn make_factory(
                                 }
                                 // Hand the advanced counters back so the next session
                                 // continues monotonically from here.
-                                ts
+                                (ts, false)
                             });
                             match feed.await {
-                                Ok(ts) => {
+                                Ok((_, true)) => {
+                                    log::info!("{task_label}: media torn down; ending feed");
+                                    return Ok(());
+                                }
+                                Ok((ts, false)) => {
                                     feed_ts = ts;
                                 }
                                 Err(e) => {
@@ -702,6 +716,17 @@ fn send_to_appsrc(
     }
     Ok(())
 }
+/// True once gst-rtsp-server has torn down the media these appsrcs were built for.
+/// Disposing the media's bin removes its children, which clears each appsrc's bus,
+/// and nothing reads from an appsrc after that.
+fn media_gone(vid_src: &Option<AppSrc>, aud_src: &Option<AppSrc>) -> bool {
+    [vid_src, aud_src]
+        .iter()
+        .copied()
+        .flatten()
+        .all(|src| src.bus().is_none())
+}
+
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
     app.pads()
@@ -779,10 +804,9 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
     source.set_is_live(true);
-    source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
+    bound_queue(&source, buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
 
@@ -829,10 +853,9 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
     source.set_is_live(false);
-    source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
+    bound_queue(&source, buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
 
@@ -881,10 +904,9 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
     source.set_is_live(true);
-    source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
+    bound_queue(&source, buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
 
@@ -967,10 +989,9 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
     source.set_is_live(false);
-    source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
+    bound_queue(&source, buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
 
@@ -1039,10 +1060,9 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
     source.set_is_live(false);
-    source.set_block(false);
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
+    bound_queue(&source, buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
 
@@ -1213,6 +1233,16 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
     Ok(queue)
 }
 
+/// Caps an appsrc's internal queue at `max_bytes`. Without a leaky type appsrc
+/// only signals enough-data at max-bytes and keeps queuing every later buffer, so
+/// a media that nobody drains grows without limit. Dropping the oldest buffers
+/// keeps what a client eventually reads close to live.
+fn bound_queue(source: &AppSrc, max_bytes: u64) {
+    source.set_block(false);
+    source.set_max_bytes(max_bytes);
+    source.set_leaky_type(AppLeakyType::Downstream);
+}
+
 fn buffer_size(_bitrate: u32) -> u32 {
     // 4 MB — big enough for a 4K h264 keyframe, modest enough that 2 streams
     // with a BufferPool min of 8 buffers stays in the low-tens-of-MB range.
@@ -1361,5 +1391,94 @@ mod tests {
         for i in 0..10_000u64 {
             assert_eq!(mono.stamp(i * 40_000, 0), Some(i * 40_000));
         }
+    }
+}
+
+#[cfg(test)]
+mod gst_tests {
+    use super::{bound_queue, clear_bin, make_element, media_gone};
+    use gstreamer::{prelude::*, Bin, Buffer, Caps, Pipeline, State};
+    use gstreamer_app::AppSrc;
+
+    fn appsrc(name: &str) -> AppSrc {
+        gstreamer::init().unwrap();
+        make_element("appsrc", name)
+            .unwrap()
+            .dynamic_cast::<AppSrc>()
+            .unwrap()
+    }
+
+    /// Builds the media's bin the way gst-rtsp-server does, a bin inside a
+    /// pipeline, keeping only the appsrcs as the feed does.
+    fn media_with(sources: &[&AppSrc]) -> Pipeline {
+        let pipeline = Pipeline::new();
+        let bin = Bin::new();
+        for src in sources {
+            bin.add(*src).unwrap();
+        }
+        pipeline.add(&bin).unwrap();
+        pipeline
+    }
+
+    /// A feed whose media has been disposed stops, so it no longer holds the
+    /// appsrcs and the camera subscription.
+    #[test]
+    fn feed_sees_disposed_media_as_gone() {
+        let vid = appsrc("vidsrc");
+        let aud = appsrc("audsrc");
+        let media = media_with(&[&vid, &aud]);
+        let (vid, aud) = (Some(vid), Some(aud));
+        assert!(!media_gone(&vid, &aud));
+        drop(media);
+        assert!(media_gone(&vid, &aud));
+    }
+
+    /// A feed with video only follows the video appsrc alone.
+    #[test]
+    fn video_only_feed_sees_disposed_media_as_gone() {
+        let vid = appsrc("vidsrc");
+        let media = media_with(&[&vid]);
+        let vid = Some(vid);
+        assert!(!media_gone(&vid, &None));
+        drop(media);
+        assert!(media_gone(&vid, &None));
+    }
+
+    /// Clearing the bin for a rebuild detaches the old appsrcs too.
+    #[test]
+    fn cleared_bin_is_gone() {
+        let vid = appsrc("vidsrc");
+        let media = media_with(&[&vid]);
+        let bin = media.children().pop().unwrap();
+        clear_bin(&bin).unwrap();
+        assert!(media_gone(&Some(vid), &None));
+    }
+
+    /// A media that never drains holds at most max-bytes in its appsrc.
+    #[test]
+    fn undrained_queue_stays_bounded() {
+        const MAX: u64 = 4096;
+        let src = appsrc("vidsrc");
+        bound_queue(&src, MAX);
+        src.set_caps(Some(&Caps::builder("application/x-test").build()));
+        // A paused fakesink takes the first buffer to preroll and then blocks,
+        // so every later buffer stays queued in the appsrc.
+        let sink = make_element("fakesink", "sink").unwrap();
+        let pipeline = Pipeline::new();
+        pipeline.add_many([src.upcast_ref(), &sink]).unwrap();
+        src.link(&sink).unwrap();
+        pipeline.set_state(State::Paused).unwrap();
+        for _ in 0..20 {
+            src.push_buffer(Buffer::from_slice(vec![0u8; 1024]))
+                .unwrap();
+        }
+        let level = src.current_level_bytes();
+        pipeline.set_state(State::Null).unwrap();
+        assert!(
+            level <= MAX,
+            "appsrc queued {} bytes, cap is {}",
+            level,
+            MAX
+        );
     }
 }
